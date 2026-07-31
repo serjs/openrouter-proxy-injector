@@ -664,7 +664,14 @@ async def proxy_request(
             logger.warning("Failed to parse request body as JSON")
 
     # Prepare request to OpenRouter
-    openrouter_url = f"https://openrouter.ai/api/v1/{path}"
+    # openrouter_url = f"https://openrouter.ai/api/v1/{path}"
+    # NEW
+    if path.startswith("v1/"):
+        openrouter_url = f"https://openrouter.ai/api/{path}"
+    elif path.startswith("api/v1/"):
+        openrouter_url = f"https://openrouter.ai/{path}"
+    else:
+        openrouter_url = f"https://openrouter.ai/api/v1/{path}"
     params = dict(request.query_params)
 
     start_time = time.time()
