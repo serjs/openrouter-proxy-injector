@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Dict, Optional, AsyncGenerator, Annotated
+from typing import List, Dict, Optional, AsyncGenerator, Annotated, Set
 from contextlib import asynccontextmanager
 import pendulum
 import httpx
@@ -92,15 +92,6 @@ TIMEZONE = os.getenv("TIMEZONE", "UTC")
 key_status: Dict[str, Optional[pendulum.DateTime]] = {}
 
 
-def non_streaming_retry():
-    """Retry decorator for non-streaming requests (network errors only)"""
-    return backoff.on_exception(
-        backoff.expo,
-        (httpx.RequestError, httpx.TimeoutException),
-        max_tries=3,
-    )
-
-
 def async_retryable(func):
     """Decorator for retrying streaming requests with key switching logic"""
 
@@ -109,6 +100,7 @@ def async_retryable(func):
         last_exception = None
         attempts = 0
         max_attempts = len(OPENROUTER_KEYS) * 2
+        failed_keys: Set[str] = set()
 
         while attempts < max_attempts:
             attempts += 1
@@ -121,7 +113,7 @@ def async_retryable(func):
             is_active = lock_time is None or current_time >= lock_time
 
             if not is_active:
-                new_key = key_manager.get_available_key()
+                new_key = key_manager.get_available_key(exclude=failed_keys)
                 if new_key:
                     logger.info(f"Switching to new key {new_key[:14]}...")
                     headers["Authorization"] = f"Bearer {new_key}"
@@ -141,18 +133,18 @@ def async_retryable(func):
                     yielded_any = True
                     yield value
                 break  # Success
-            except (HTTPException, httpx.HTTPStatusError, Exception) as e:
+            except (HTTPException, httpx.HTTPStatusError) as e:
                 if yielded_any:
                     logger.warning(
                         f"Error mid-stream, cannot retry: {type(e).__name__}: {e}"
                     )
                     raise e
 
-                status_code = 500
-                if isinstance(e, HTTPException):
-                    status_code = e.status_code
-                elif isinstance(e, httpx.HTTPStatusError):
-                    status_code = e.response.status_code
+                status_code = (
+                    e.status_code
+                    if isinstance(e, HTTPException)
+                    else e.response.status_code
+                )
 
                 if status_code in (429, 402):
                     response = (
@@ -166,8 +158,9 @@ def async_retryable(func):
                     logger.info(
                         f"Key {selected_key[:14]}... {'rate limited' if status_code == 429 else 'payment required'} before stream started, switching..."
                     )
+                    failed_keys.add(selected_key)
 
-                    new_key = key_manager.get_available_key()
+                    new_key = key_manager.get_available_key(exclude=failed_keys)
                     if new_key:
                         headers["Authorization"] = f"Bearer {new_key}"
                         kwargs["headers"] = headers
@@ -181,37 +174,13 @@ def async_retryable(func):
                     )
                     last_exception = e
                     await asyncio.sleep(random.uniform(0.5, 1.5))
-            except (HTTPException, httpx.HTTPStatusError) as e:
-                status_code = (
-                    e.status_code
-                    if isinstance(e, HTTPException)
-                    else e.response.status_code
-                )
-                if status_code in (429, 402):
-                    response = None
-                    if isinstance(e, httpx.HTTPStatusError):
-                        response = e.response
-                    if response:
-                        await key_manager.handle_rate_limit_response(
-                            selected_key, response
-                        )
-
-                    logger.info(
-                        f"Key {selected_key[:14]}... {'rate limited' if status_code == 429 else 'payment required'}, switching..."
-                    )
-
-                    # Force switch to a new key for the next attempt
-                    new_key = key_manager.get_available_key()
-                    if new_key:
-                        headers["Authorization"] = f"Bearer {new_key}"
-                        kwargs["headers"] = headers
-                        kwargs["selected_key"] = new_key
-
-                    last_exception = e
-                    await asyncio.sleep(random.uniform(0.1, 0.5))  # Small jitter
-                else:
-                    raise
             except Exception as e:
+                if yielded_any:
+                    logger.warning(
+                        f"Error mid-stream, cannot retry: {type(e).__name__}: {e}"
+                    )
+                    raise e
+
                 logger.warning(f"Attempt {attempts} failed: {type(e).__name__}: {e}")
                 last_exception = e
                 await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -221,7 +190,33 @@ def async_retryable(func):
     return wrapper
 
 
-@non_streaming_retry()
+@backoff.on_exception(
+    backoff.expo,
+    (httpx.RequestError, httpx.TimeoutException),
+    max_tries=3,
+    max_time=60,
+    logger=logger,
+)
+async def _openrouter_request(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    content: bytes,
+    params: Dict[str, str],
+    timeout: float,
+):
+    """Sends a single request to OpenRouter. Transient network errors are retried by backoff"""
+    return await client.request(
+        method=method,
+        url=url,
+        headers=headers,
+        content=content,
+        params=params,
+        timeout=timeout,
+    )
+
+
 async def make_openrouter_request(
     client: httpx.AsyncClient,
     method: str,
@@ -231,9 +226,13 @@ async def make_openrouter_request(
     params: Dict[str, str],
     timeout: float,
 ):
-    """Makes a non-streaming request to OpenRouter with retry logic"""
+    """Makes a non-streaming request to OpenRouter with retry logic.
+
+    Returns None when the request could not be delivered after all retries.
+    """
     try:
-        response = await client.request(
+        return await _openrouter_request(
+            client=client,
             method=method,
             url=url,
             headers=headers,
@@ -241,37 +240,9 @@ async def make_openrouter_request(
             params=params,
             timeout=timeout,
         )
-        return response
-    except httpx.RequestError as e:
-        logger.warning(f"Request error: {str(e)}")
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        logger.warning(f"OpenRouter request failed after retries: {str(e)}")
         return None
-
-
-def check_retryable_error(response: httpx.Response) -> bool:
-    """Checks if the error in the httpx.Response is retryable based on its content"""
-    try:
-        error_content = response.json()
-        if not isinstance(error_content, dict):
-            return False
-        error_data = error_content.get("error", {})
-        error_message = (
-            error_data.get("message", "") if isinstance(error_data, dict) else ""
-        )
-        error_code = (
-            error_data.get("code", None) if isinstance(error_data, dict) else None
-        )
-
-        if str(error_code) == "429" and "Provider returned error" in error_message:
-            return True
-
-    except json.JSONDecodeError:
-        logger.warning("Failed to decode JSON from response body during retry check")
-    except Exception as e:
-        logger.error(f"Unexpected error checking retryable error: {str(e)}")
-
-    return False
-
-
 
 
 def sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -340,7 +311,6 @@ class KeyManager:
     """Manages OpenRouter API keys, including rotation, rate limiting, and usage tracking"""
 
     def __init__(self):
-        self.current_index = 0
         self.key_configs = {c["key"]: c for c in OPENROUTER_CONFIG}
         self.usage_stats = {
             key: {
@@ -367,16 +337,25 @@ class KeyManager:
                     # If it was blocked until midnight, clear it
                     key_status[key] = None
 
-    def get_available_key(self) -> Optional[str]:
-        """Selects an available API key based on capacity and rate limits"""
+    def get_available_key(self, exclude: Optional[Set[str]] = None) -> Optional[str]:
+        """Selects an available API key based on capacity and rate limits.
+
+        Keys listed in `exclude` are skipped, so a key that just failed is never
+        picked again for the same client request.
+        """
         if not OPENROUTER_KEYS:
             return None
 
         self._check_and_reset_quotas()
         current_time = pendulum.now(TIMEZONE)
+        excluded = exclude or set()
 
         candidates = []
         for key in OPENROUTER_KEYS:
+            # 0. Skip keys that already failed for this request
+            if key in excluded:
+                continue
+
             # 1. Check if blocked by 429/402
             lock_time = key_status.get(key)
             if lock_time and current_time < lock_time:
@@ -421,6 +400,33 @@ class KeyManager:
         )
         return selected_key
 
+    def _lock_key(self, key: str, seconds: int, reason: str):
+        """Blocks a key for the given number of seconds"""
+        unlock_time = pendulum.now(TIMEZONE).add(seconds=seconds)
+        key_status[key] = unlock_time
+        logger.warning(f"Key {key[:14]}... {reason}. Blocked for {seconds}s.")
+
+    def refund_daily_quota(self, key: str):
+        """Gives back a reserved daily slot when the request never reached OpenRouter.
+
+        The RPM slot is kept on purpose so a failing upstream is not hammered.
+        """
+        if key not in self.usage_stats:
+            return
+
+        stats = self.usage_stats[key]
+        lock_time = key_status.get(key)
+        if lock_time and pendulum.now(TIMEZONE) < lock_time:
+            # Key is blocked, its counter is authoritative - leave it alone
+            return
+
+        if stats["daily_count"] > 0:
+            stats["daily_count"] -= 1
+            logger.debug(
+                f"Refunded daily quota for key {key[:14]}... "
+                f"(Usage: {stats['daily_count']}/{self.key_configs[key]['limit']})"
+            )
+
     def block_key_until_next_day(self, key: str):
         """Blocks a key until the next daily reset (e.g., when daily limit is reached)"""
         unlock_time = self._get_next_reset().in_timezone(TIMEZONE)
@@ -435,7 +441,12 @@ class KeyManager:
         )
 
     async def handle_rate_limit_response(self, key: str, response: httpx.Response):
-        """Handles 429 and 402 responses by blocking keys for appropriate durations"""
+        """Handles 429 and 402 responses by blocking keys for appropriate durations.
+
+        A 429 always blocks the key, even when the body cannot be parsed or does
+        not match a known pattern - otherwise rotation keeps picking the same
+        failing key and burns every retry attempt on it.
+        """
         try:
             if response.status_code == 402:
                 # Payment Required - block for 5 minutes and warn user
@@ -446,59 +457,46 @@ class KeyManager:
                 )
                 return
 
+            error_content = None
             try:
                 error_content_bytes = await response.aread()
                 error_content = json.loads(error_content_bytes.decode("utf-8"))
-            except json.decoder.JSONDecodeError:
+            except (json.decoder.JSONDecodeError, UnicodeDecodeError):
+                error_content = None
+            except Exception as e:
+                logger.warning(f"Failed to read error body: {str(e)}")
                 error_content = None
 
-            if error_content and isinstance(error_content, dict):
+            error_message = ""
+            error_code = None
+            if isinstance(error_content, dict):
                 error_data = error_content.get("error", {})
-                error_message = (
-                    error_data.get("message", "")
-                    if isinstance(error_data, dict)
-                    else ""
-                )
-                error_code = (
-                    error_data.get("code", None)
-                    if isinstance(error_data, dict)
-                    else None
-                )
+                if isinstance(error_data, dict):
+                    error_message = error_data.get("message", "") or ""
+                    error_code = error_data.get("code", None)
 
-                if str(error_code) == "429":
-                    if (
-                        "free-models-per-day" in error_message
-                        or "Credits exhausted" in error_message
-                    ):
-                        self.block_key_until_next_day(key)
-                        logger.warning(
-                            f"Key {key[:14]}... blocked until next day: {error_message}"
-                        )
-                    elif "Provider returned error" in error_message:
-                        # Temporary model-level rate limit from upstream provider
-                        unlock_time = pendulum.now(TIMEZONE).add(seconds=30)
-                        key_status[key] = unlock_time
-                        logger.warning(
-                            f"Key {key[:14]}... upstream provider rate-limit. Blocked for 30s."
-                        )
-                    else:
-                        # Other 429 (e.g. OpenRouter's own rate limit for the key)
-                        unlock_time = pendulum.now(TIMEZONE).add(seconds=10)
-                        key_status[key] = unlock_time
-                        logger.warning(
-                            f"Key {key[:14]}... OpenRouter rate-limit. Blocked for 10s."
-                        )
-                else:
-                    logger.warning(
-                        f"Key {key[:14]}... received error {error_code}: {error_message}"
-                    )
-            else:
+            if (
+                "free-models-per-day" in error_message
+                or "Credits exhausted" in error_message
+            ):
+                self.block_key_until_next_day(key)
                 logger.warning(
-                    f"Key {key[:14]}... received status {response.status_code}. Response body is not JSON."
+                    f"Key {key[:14]}... blocked until next day: {error_message}"
+                )
+            elif "Provider returned error" in error_message:
+                # Temporary model-level rate limit from upstream provider
+                self._lock_key(key, 30, "upstream provider rate-limit")
+            else:
+                # Any other 429: OpenRouter's own per-key limit, or a body we could
+                # not classify. The key must be locked so rotation moves on.
+                self._lock_key(key, 10, "OpenRouter rate-limit")
+                logger.debug(
+                    f"Key {key[:14]}... error_code={error_code} message={error_message}"
                 )
 
         except Exception as e:
             logger.error(f"Unexpected error handling rate limit response: {str(e)}")
+            self._lock_key(key, 10, "unexpected error while handling rate limit")
 
     def get_key_statuses(self) -> Dict[str, Dict]:
         """Returns the current status and usage statistics for all API keys"""
@@ -612,6 +610,8 @@ async def forward_streaming(
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except httpx.RequestError as e:
         logger.error(f"[{masked_key_str}] Request failed: {str(e)}")
+        # The request never reached OpenRouter, so it consumed no quota
+        key_manager.refund_daily_quota(selected_key)
         raise HTTPException(status_code=500, detail="OpenRouter API unavailable")
 
 
@@ -810,20 +810,24 @@ async def proxy_request(
         )
 
         if not response:
+            # The request never reached OpenRouter, so it consumed no quota
+            key_manager.refund_daily_quota(selected_key)
             raise HTTPException(status_code=502, detail="OpenRouter request failed")
 
         log_response_debug(response, prefix=masked_key_str)
 
         # Handle request limit and retry with different keys if needed
         attempts = 0
+        failed_keys: Set[str] = set()
         while response.status_code in (429, 402) and attempts < 10:
             attempts += 1
             logger.warning(
                 f"[{mask_key(selected_key)}] Received {response.status_code} status. Attempt {attempts}"
             )
             await key_manager.handle_rate_limit_response(selected_key, response)
+            failed_keys.add(selected_key)
 
-            selected_key = key_manager.get_available_key()
+            selected_key = key_manager.get_available_key(exclude=failed_keys)
             if not selected_key:
                 break
 
@@ -840,6 +844,8 @@ async def proxy_request(
                 timeout=300,
             )
             if not response:
+                # The request never reached OpenRouter, so it consumed no quota
+                key_manager.refund_daily_quota(selected_key)
                 break
             log_response_debug(response, prefix=masked_key_str)
 
